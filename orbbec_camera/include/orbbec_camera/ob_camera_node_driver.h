@@ -69,6 +69,12 @@ class OBCameraNodeDriver : public rclcpp::Node {
 
   void checkConnectTimer();
 
+  // Liveness-watchdog recovery: force-terminate this process so the launch
+  // container (respawn=True) reloads only this camera. Must NOT use
+  // rclcpp::shutdown() — the query/reset threads may be blocked in
+  // uninterruptible SDK calls, deadlocking the destructor's thread joins.
+  [[noreturn]] void recoverAndExit(const std::string& reason);
+
   void queryDevice();
 
   void resetDevice();
@@ -129,6 +135,16 @@ class OBCameraNodeDriver : public rclcpp::Node {
   std::string net_device_ip_;
   int net_device_port_ = 0;
   int connection_delay_ = 100;
+  // Liveness-watchdog tuning (driven by checkConnectTimer at 1 Hz).
+  // <= 0 disables the corresponding check.
+  double connection_timeout_s_ = 30.0;   // max time disconnected before recovery
+  double frame_stall_timeout_s_ = 10.0;  // max no-frame gap after a healthy start
+  // Anchor for the connection-timeout grace; reset on every connected->disconnected
+  // edge so a runtime drop gets the same window as startup (lets the driver's own
+  // reconnect logic try first before we force a respawn).
+  std::chrono::steady_clock::time_point not_connected_since_;
+  std::chrono::steady_clock::time_point device_connected_time_;
+  bool was_connected_ = false;  // tracks connected-state edges for the grace windows
   bool enable_sync_host_time_ = true;
   std::chrono::milliseconds time_sync_period_{6000};
   std::string preset_firmware_path_;

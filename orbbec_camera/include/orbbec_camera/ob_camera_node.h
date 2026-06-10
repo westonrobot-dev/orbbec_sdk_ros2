@@ -196,6 +196,19 @@ class OBCameraNode {
     fps_delay_status_depth_->fillDepthStatus(status_msg);
   }
 
+  // Seconds since the most recent frame set was received, for the driver's
+  // frame-stall watchdog. Returns -1.0 if no frame has arrived yet. Lock-free.
+  double getSecondsSinceLastFrame() const {
+    int64_t last_ns = last_frameset_time_ns_.load(std::memory_order_relaxed);
+    if (last_ns == 0) {
+      return -1.0;
+    }
+    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    return static_cast<double>(now_ns - last_ns) / 1e9;
+  }
+
   bool checkUserCalibrationReady() {
     static bool first_check = true;
     if (first_check) {
@@ -761,6 +774,9 @@ class OBCameraNode {
   OBStreamType align_target_stream_ = OB_STREAM_COLOR;
   bool retry_on_usb3_detection_failure_ = false;
   std::atomic_bool is_camera_node_initialized_{false};
+  // steady_clock nanoseconds of the last received frame set (0 = none yet);
+  // read by the driver's frame-stall watchdog via getSecondsSinceLastFrame().
+  std::atomic<int64_t> last_frameset_time_ns_{0};
   int laser_energy_level_ = -1;
   ob::PointCloudFilter depth_point_cloud_filter_;
   ob::PointCloudFilter color_point_cloud_filter_;
