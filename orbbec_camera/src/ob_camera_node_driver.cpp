@@ -24,6 +24,8 @@
 #include <rclcpp_components/register_node_macro.hpp>
 #include <rcutils/logging.h>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <filesystem>
@@ -267,6 +269,9 @@ void OBCameraNodeDriver::init() {
 
   device_type_ = declare_parameter<std::string>("device_type", "camera");
   connection_delay_ = static_cast<int>(declare_parameter<int>("connection_delay", 100));
+  connection_timeout_s_ = declare_parameter<double>("connection_timeout_s", connection_timeout_s_);
+  frame_stall_timeout_s_ =
+      declare_parameter<double>("frame_stall_timeout_s", frame_stall_timeout_s_);
   enable_sync_host_time_ = declare_parameter<bool>("enable_sync_host_time", true);
   double time_sync_period = declare_parameter<double>("time_sync_period", 60.0);
   time_sync_period_ = std::chrono::milliseconds((int)(time_sync_period * 1000));
@@ -299,6 +304,8 @@ void OBCameraNodeDriver::init() {
   orb_device_lock_ = (pthread_mutex_t *)orb_device_lock_shm_addr_;
   pthread_mutex_init(orb_device_lock_, &orb_device_lock_attr_);
   is_alive_.store(true);
+  // Anchor for the connection-timeout watchdog (see checkConnectTimer).
+  not_connected_since_ = std::chrono::steady_clock::now();
   // Initialize the reset device completion time to allow immediate device connection on startup
   last_reset_device_completion_time_ = std::chrono::steady_clock::now() - std::chrono::seconds(10);
   parameters_ = std::make_shared<Parameters>(this);
@@ -434,13 +441,69 @@ OBLogSeverity OBCameraNodeDriver::obLogSeverityFromString(const std::string_view
 }
 
 void OBCameraNodeDriver::checkConnectTimer() {
+  const auto now = std::chrono::steady_clock::now();
   if (!device_connected_.load()) {
     RCLCPP_DEBUG_STREAM(logger_,
                         "checkConnectTimer: device " << serial_number_ << " not connected");
+    // On a connected->disconnected edge, restart the grace window so a runtime
+    // drop gets the driver's own reconnect logic a chance before we force a respawn.
+    if (was_connected_) {
+      not_connected_since_ = now;
+      was_connected_ = false;
+    }
+    // Connection-timeout watchdog: queryDevice() can block forever in an
+    // uninterruptible SDK enumeration call (ctx_->queryDeviceList()) when the USB
+    // endpoint is left in a bad state, so the device never connects and nothing
+    // recovers (respawn only fires on process death). Force a process exit so the
+    // launch container reloads this camera.
+    if (connection_timeout_s_ > 0.0) {
+      const double not_connected_s =
+          std::chrono::duration<double>(now - not_connected_since_).count();
+      if (not_connected_s > connection_timeout_s_) {
+        recoverAndExit("device " + serial_number_ + " failed to connect within " +
+                       std::to_string(connection_timeout_s_) +
+                       "s (likely wedged USB enumeration)");
+      }
+    }
     return;
-  } else if (!ob_camera_node_ && !ob_lidar_node_) {
-    device_connected_.store(false);
   }
+  if (!ob_camera_node_ && !ob_lidar_node_) {
+    device_connected_.store(false);
+    return;
+  }
+  // Mark the (re)connection edge so the frame-stall grace is measured from here.
+  if (!was_connected_) {
+    was_connected_ = true;
+    device_connected_time_ = now;
+  }
+  // Frame-stall watchdog (camera only): a connected device that stops delivering
+  // frames is equally unrecoverable in-process. Until the first frame arrives the
+  // stall is measured from the connection edge.
+  if (frame_stall_timeout_s_ > 0.0 && device_type_ == "camera" && ob_camera_node_) {
+    const double frame_age_s = ob_camera_node_->getSecondsSinceLastFrame();
+    const double stall_s =
+        (frame_age_s < 0.0)
+            ? std::chrono::duration<double>(now - device_connected_time_).count()
+            : frame_age_s;
+    if (stall_s > frame_stall_timeout_s_) {
+      recoverAndExit("device " + serial_number_ + " connected but produced no frames for " +
+                     std::to_string(stall_s) + "s");
+    }
+  }
+}
+
+void OBCameraNodeDriver::recoverAndExit(const std::string &reason) {
+  RCLCPP_FATAL_STREAM(logger_, "Camera liveness watchdog: " << reason
+                                                            << ". Forcing process exit so the "
+                                                               "launch container respawns it.");
+  // Flush logs/streams before bypassing normal teardown. We must hard-exit rather
+  // than rclcpp::shutdown(): the query/reset threads may be blocked in
+  // uninterruptible SDK calls, so the destructor's joins (query_thread_->join())
+  // would deadlock. The launch container's respawn=True reloads only this camera.
+  // Follow-up (see plan/TODO): issue a USB reset of the device here first to break
+  // the alternate-restart toggle so the respawn reconnects on the first cycle.
+  std::fflush(nullptr);
+  std::_Exit(EXIT_FAILURE);
 }
 
 void OBCameraNodeDriver::queryDevice() {

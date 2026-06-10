@@ -3733,6 +3733,11 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
   }
   const auto frame_set_arrival_system_us = getSystemNowUs();
   const auto frame_set_arrival_steady_us = getSteadyNowUs();
+  // Stamp frame liveness for the driver's frame-stall watchdog.
+  last_frameset_time_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count(),
+                               std::memory_order_relaxed);
   try {
     if (!tf_published_) {
       publishStaticTransforms();
